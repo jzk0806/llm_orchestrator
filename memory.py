@@ -94,8 +94,8 @@ class SQLiteMemoryStore:
         row = self.pending_event(event_id)
         if row['status'] != 'pending':
             raise ValueError(f'Event {event_id} has already been completed.')
-        if completed_step <= int(row['decision_step']):
-            raise ValueError('completed_step must be later than decision_step.')
+        if completed_step < int(row['decision_step']):
+            raise ValueError('completed_step cannot precede decision_step.')
         salient = self.will_be_salient(row=row, outcome=outcome, salience_outcome_threshold=salience_outcome_threshold)
         with self._lock, self._connection() as connection:
             connection.execute("\n                UPDATE orchestration_events SET\n                    completed_step = ?, status = 'completed', outcome_json = ?,\n                    salient = ?, embedding_json = ?, embedding_id = ?,\n                    embedding_dimensions = ?, completed_at = ?\n                WHERE event_id = ? AND status = 'pending'\n                ", (completed_step, outcome.model_dump_json(), int(salient), _canonical_json(list(embedding)) if embedding is not None else None, embedding_identifier, len(embedding) if embedding is not None else None, _utc_now(), event_id))
@@ -107,7 +107,7 @@ class SQLiteMemoryStore:
         context = json.loads(row['context_json'])
         instruction = str(context.get('instruction', 'none')).strip().lower()
         explicit_command = instruction not in {'', 'none', 'waiting', 'no command'}
-        return explicit_command or 'instruction_change' in reasons or 'grid_alert' in reasons or outcome.constraint_violation or (outcome.metric_improvement.magnitude() >= salience_outcome_threshold)
+        return explicit_command or 'instruction_change' in reasons or 'grid_alert_onset' in reasons or bool(context.get('grid_alert')) or outcome.constraint_violation or (outcome.metric_improvement.magnitude() >= salience_outcome_threshold)
 
     @staticmethod
     def _row_to_memory(row: sqlite3.Row, similarity: Optional[float]=None) -> MemoryRecord:
@@ -137,3 +137,4 @@ class SQLiteMemoryStore:
         result = {'pending': 0, 'completed': 0}
         result.update({row['status']: int(row['count']) for row in rows})
         return result
+

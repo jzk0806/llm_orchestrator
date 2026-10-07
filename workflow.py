@@ -7,8 +7,8 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence
-from dotenv import load_dotenv
 from langgraph.graph import END, START, StateGraph
+from langsmith import tracing_context
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import NotRequired, TypedDict
 from .api import AssessmentCallError, AssessmentClient, ChatAPISettings, DeterministicHashEmbeddingClient, EmbeddingCallError, EmbeddingAPISettings, EmbeddingClient, OpenAICompatibleAssessmentClient, OpenAICompatibleEmbeddingClient
@@ -108,15 +108,15 @@ class PaperLLMOrchestrator:
 
     @classmethod
     def from_environment(cls, *, config_path: str | Path, database_path: str | Path, env_file: Optional[str | Path]=None, audit_log_path: Optional[str | Path]=None, assessment_client: Optional[AssessmentClient]=None, embedding_client: Optional[EmbeddingClient]=None) -> 'PaperLLMOrchestrator':
-        if env_file:
-            load_dotenv(Path(env_file), override=False)
+        if env_file is not None:
+            raise ValueError('Configure credentials through process environment variables.')
         config = OrchestratorConfig.from_json(config_path)
         if assessment_client is None:
-            assessment_client = OpenAICompatibleAssessmentClient(ChatAPISettings(base_url=os.getenv('LLM_BASE_URL', 'http://127.0.0.1:8000/v1'), api_key=os.getenv('LLM_API_KEY', 'EMPTY'), model=os.getenv('LLM_MODEL', 'Qwen/Qwen3.5-9B'), max_tokens=int(os.getenv('LLM_MAX_TOKENS', '512')), timeout_seconds=float(os.getenv('LLM_TIMEOUT_SECONDS', '60')), seed=int(os.environ['LLM_SEED']) if os.getenv('LLM_SEED', '').strip() else 42, constrained_json_schema=_env_bool('LLM_CONSTRAINED_JSON_SCHEMA', True), enable_thinking=_env_bool('LLM_ENABLE_THINKING', False), schema_repair_attempts=int(os.getenv('LLM_SCHEMA_REPAIRS', '1')), provider=os.getenv('LLM_PROVIDER', 'vllm').strip().lower()))
+            assessment_client = OpenAICompatibleAssessmentClient(ChatAPISettings.from_environment())
         if embedding_client is None:
-            backend = os.getenv('EMBEDDING_BACKEND', 'api').strip().lower()
+            backend = os.getenv('EMBEDDING_BACKEND', 'hash').strip().lower()
             if backend == 'api':
-                embedding_client = OpenAICompatibleEmbeddingClient(EmbeddingAPISettings(base_url=os.getenv('EMBEDDING_BASE_URL', 'http://127.0.0.1:8001/v1'), api_key=os.getenv('EMBEDDING_API_KEY', 'EMPTY'), model=os.getenv('EMBEDDING_MODEL', 'BAAI/bge-small-en-v1.5'), revision=os.getenv('EMBEDDING_REVISION', 'frozen-server-revision'), timeout_seconds=float(os.getenv('EMBEDDING_TIMEOUT_SECONDS', '30')), dimensions=int(os.environ['EMBEDDING_DIMENSIONS']) if os.getenv('EMBEDDING_DIMENSIONS', '').strip() else None, encoding_format=os.getenv('EMBEDDING_ENCODING_FORMAT', '').strip() or None))
+                embedding_client = OpenAICompatibleEmbeddingClient(EmbeddingAPISettings.from_environment())
             elif backend == 'hash':
                 embedding_client = DeterministicHashEmbeddingClient(dimensions=int(os.getenv('HASH_EMBEDDING_DIMENSIONS', '256')))
             else:
@@ -172,7 +172,7 @@ class PaperLLMOrchestrator:
             state_change_inf = max((abs(normalized_current[name] - previous_normalized[name]) for name in FEATURE_ORDER))
         else:
             state_change_inf = 0.0
-        context = {'causal_boundary': 'All values were available before the control action at this step; no realized value after the decision step is included.', 'price_regime': {'level': self._bin(price_z), 'definition': 'relative to preceding observations only', 'preceding_observations': min(len(previous_history), self.config.lookback_intervals)}, 'trends': trends, 'asset_state': {'ev_available': observation.ev_available, 'normalized_bins': {name: self._bin(normalized_current[name]) for name in ('pv_power', 'requested_load', 'battery_soc', 'ev_soc', 'predicted_net_power')}}, 'pcc_state': {'exchange_bin': self._bin(normalized_current['exchange_power']), 'exchange_trend': trends['exchange_power']}, 'instruction': observation.instruction, 'grid_alert': observation.grid_alert, 'binned_trailing_window': binned_window}
+        context = {'causal_boundary': 'All values were available before the control action at this step; no realized value after the decision step is included.', 'price_regime': {'level': self._bin(price_z), 'definition': 'relative to preceding observations only', 'preceding_observations': min(len(previous_history), self.config.lookback_intervals)}, 'trends': trends, 'asset_state': {'ev_available': observation.ev_available, 'normalized_bins': {name: self._bin(normalized_current[name]) for name in ('pv_power', 'requested_load', 'battery_soc', 'ev_soc', 'pre_control_net_power')}}, 'pcc_state': {'exchange_bin': self._bin(normalized_current['exchange_power']), 'exchange_trend': trends['exchange_power']}, 'instruction': observation.instruction, 'grid_alert': observation.grid_alert, 'binned_trailing_window': binned_window}
         return {'semantic_context': context, 'normalized_current': normalized_current, 'price_z_score': price_z, 'state_change_inf': state_change_inf}
 
     def _perception_node(self, state: WorkflowState) -> Dict[str, Any]:
@@ -186,8 +186,8 @@ class PaperLLMOrchestrator:
             reasons.append('initialization')
         if session.history and observation.instruction != session.last_instruction:
             reasons.append('instruction_change')
-        if observation.grid_alert:
-            reasons.append('grid_alert')
+        if observation.grid_alert and not session.last_grid_alert:
+            reasons.append('grid_alert_onset')
         if abs(state['price_z_score']) >= self.config.price_z_trigger_threshold:
             reasons.append('trailing_price_deviation')
         if state['state_change_inf'] >= self.config.state_change_trigger_threshold:
@@ -210,17 +210,18 @@ class PaperLLMOrchestrator:
         except Exception as error:
             long_memory = []
             failed_usage = error.usage if isinstance(error, EmbeddingCallError) else APIUsage()
-            return {'short_memory': short_memory, 'long_memory': long_memory, 'embedding_usage': failed_usage, 'retrieval_warning': f'LTM retrieval unavailable: {type(error).__name__}: {error}'}
+            return {'short_memory': short_memory, 'long_memory': long_memory, 'embedding_usage': failed_usage, 'retrieval_warning': f'LTM retrieval unavailable: {type(error).__name__}'}
         return {'short_memory': short_memory, 'long_memory': long_memory, 'embedding_usage': embedding_result.usage}
 
     def _reason_node(self, state: WorkflowState) -> Dict[str, Any]:
         prompt = build_user_prompt(semantic_context=state['semantic_context'], current_step=state['observation'].step, event_reasons=state['trigger_reasons'], short_term_memory=state.get('short_memory', []), long_term_memory=state.get('long_memory', []))
         try:
             assessment, usage, prompt_hash = self.assessment_client.assess(prompt)
+            assessment = LLMAssessment.model_validate(assessment.model_dump(by_alias=True) if isinstance(assessment, LLMAssessment) else assessment)
             return {'assessment': assessment, 'api_usage': state.get('embedding_usage', APIUsage()).add(usage), 'prompt_sha256': prompt_hash, 'fallback_used': False}
         except Exception as error:
             retrieval_warning = state.get('retrieval_warning')
-            parts = [f'LLM assessment unavailable: {type(error).__name__}: {error}']
+            parts = [f'LLM assessment unavailable: {type(error).__name__}']
             if retrieval_warning:
                 parts.append(retrieval_warning)
             if isinstance(error, AssessmentCallError):
@@ -247,13 +248,9 @@ class PaperLLMOrchestrator:
             if agent != active:
                 weighted_score -= self.config.switching_penalty
             q_scores[agent.value] = weighted_score
-        proposal = active
-        best_score = q_scores[active.value]
-        for agent in AGENT_ORDER:
-            candidate = q_scores[agent.value]
-            if candidate > best_score + 1e-12:
-                proposal = agent
-                best_score = candidate
+        best_score = max(q_scores.values())
+        tied = [agent for agent in AGENT_ORDER if best_score - q_scores[agent.value] <= 1e-12]
+        proposal = active if active in tied else tied[0]
         handover_gain = q_scores[proposal.value] - q_scores[active.value]
         evidence = assessment.evidence
         return {'q_scores': q_scores, 'priority_weights': weights, 'agent_scores': serializable_scores, 'reasoning_summary': {'grid_analysis': evidence.grid_analysis, 'prosumer_analysis': evidence.prosumer_analysis, 'market_analysis': evidence.market_analysis, 'memory_analysis': evidence.memory_analysis, 'synthesis': evidence.synthesis}, 'confidence': assessment.confidence, 'pre_gate_proposal': proposal, 'handover_gain': handover_gain}
@@ -264,7 +261,7 @@ class PaperLLMOrchestrator:
             selected = AgentName.GRID
         elif state.get('fallback_used', False):
             selected = active
-        elif state['pre_gate_proposal'] != active and state['handover_gain'] >= self.config.handover_margin:
+        elif state['pre_gate_proposal'] != active and state['handover_gain'] + 1e-12 >= self.config.handover_margin:
             selected = state['pre_gate_proposal']
         else:
             selected = active
@@ -284,6 +281,7 @@ class PaperLLMOrchestrator:
             session.last_event_step = observation.step
         session.active_agent = state['selected_agent']
         session.last_instruction = observation.instruction
+        session.last_grid_alert = observation.grid_alert
         session.history = (session.history + [observation])[-self.config.lookback_intervals:]
         self.memory.save_session(session)
         return {'session': session, 'event_id': event_id}
@@ -305,7 +303,7 @@ class PaperLLMOrchestrator:
         builder.add_edge('react_cot_assessment', 'deterministic_score')
         builder.add_edge('deterministic_score', 'safety_and_handover_gate')
         builder.add_edge('safety_and_handover_gate', 'persist_state')
-        builder.add_edge('retain_active_agent', 'persist_state')
+        builder.add_edge('retain_active_agent', 'safety_and_handover_gate')
         builder.add_edge('persist_state', END)
         return builder.compile()
 
@@ -315,9 +313,16 @@ class PaperLLMOrchestrator:
 
     def _decide_locked(self, observation: Observation) -> DecisionResult:
         session = self.memory.load_session(observation.prosumer_id, self.config.initial_agent)
-        if session.history and observation.step <= session.history[-1].step:
-            raise ValueError('Observation steps must be strictly increasing for each prosumer.')
-        final_state = self.graph.invoke({'observation': observation, 'session': session, 'active_before': session.active_agent})
+        if not session.history and observation.step != 1:
+            raise ValueError('A new controller session starts at step 1.')
+        if session.history:
+            previous = session.history[-1]
+            if observation.step != previous.step + 1:
+                raise ValueError('Observation steps must be consecutive for each prosumer.')
+            if (observation.timestamp - previous.timestamp).total_seconds() != 900:
+                raise ValueError('Observation timestamps must be 15 minutes apart.')
+        with tracing_context(enabled=False):
+            final_state = self.graph.invoke({'observation': observation, 'session': session, 'active_before': session.active_agent})
         result = DecisionResult(prosumer_id=observation.prosumer_id, step=observation.step, event_triggered=final_state['event_triggered'], trigger_reasons=final_state['trigger_reasons'], api_called=final_state['api_usage'].calls > 0, active_agent_before=final_state['active_before'], pre_gate_proposal=final_state['pre_gate_proposal'], selected_agent=final_state['selected_agent'], switched=final_state['selected_agent'] != final_state['active_before'], handover_gain=final_state['handover_gain'], q_scores=final_state['q_scores'], priority_weights=final_state['priority_weights'], agent_scores=final_state['agent_scores'], reasoning_summary=final_state['reasoning_summary'], confidence=final_state['confidence'], event_id=final_state.get('event_id'), retrieval_warning=final_state.get('retrieval_warning'), fallback_used=final_state.get('fallback_used', False), fallback_reason=final_state.get('fallback_reason'), prompt_sha256=final_state.get('prompt_sha256'), api_usage=final_state['api_usage'])
         self._write_audit(result)
         return result
@@ -325,6 +330,11 @@ class PaperLLMOrchestrator:
     def complete_event(self, *, event_id: str, completed_step: int, outcome: EventOutcome) -> EventCompletionResult:
         row = self.memory.pending_event(event_id)
         with self._prosumer_lock(row['prosumer_id']):
+            if row['status'] != 'pending':
+                raise ValueError('The event has already been completed.')
+            session = self.memory.load_session(row['prosumer_id'], self.config.initial_agent)
+            if not session.history or completed_step > session.history[-1].step:
+                raise ValueError('An event cannot be completed in an unobserved future interval.')
             embedding_warning: Optional[str] = None
             embedding_usage = APIUsage()
             embedding_vector = None
@@ -339,7 +349,7 @@ class PaperLLMOrchestrator:
                 except Exception as error:
                     if isinstance(error, EmbeddingCallError):
                         embedding_usage = error.usage
-                    embedding_warning = f'LTM indexing unavailable: {type(error).__name__}: {error}'
+                    embedding_warning = f'LTM indexing unavailable: {type(error).__name__}'
             salient = self.memory.complete_event(event_id=event_id, completed_step=completed_step, outcome=outcome, embedding=embedding_vector, embedding_identifier=embedding_identifier, salience_outcome_threshold=self.config.salience_outcome_threshold)
             return EventCompletionResult(event_id=event_id, salient=salient, long_term_indexed=salient and embedding_vector is not None, embedding_warning=embedding_warning, api_usage=embedding_usage)
 
@@ -370,3 +380,4 @@ class RLAgentRegistry:
     def dispatch(self, decision: DecisionResult, rl_state: Mapping[str, Any]) -> Any:
         self.validate_complete()
         return self._policies[decision.selected_agent](rl_state)
+

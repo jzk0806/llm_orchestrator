@@ -10,23 +10,26 @@ class AgentName(str, Enum):
     SELF = 'Self'
     GRID = 'Grid'
 AGENT_ORDER = (AgentName.PROFIT, AgentName.COMFORT, AgentName.SELF, AgentName.GRID)
-FEATURE_ORDER = ('cleared_price', 'pv_power', 'requested_load', 'battery_soc', 'ev_soc', 'ev_available', 'predicted_net_power', 'exchange_power')
+FEATURE_ORDER = ('cleared_price', 'pv_power', 'requested_load', 'battery_soc', 'ev_soc', 'ev_available', 'pre_control_net_power', 'exchange_power')
 
 class Observation(BaseModel):
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
     prosumer_id: str = Field(min_length=1)
-    step: int = Field(ge=0)
+    step: int = Field(ge=1)
     timestamp: datetime
     cleared_price: float
-    pv_power: float
-    requested_load: float
+    pv_power: float = Field(ge=0.0)
+    requested_load: float = Field(ge=0.0)
     battery_soc: float = Field(ge=0.0, le=1.0)
     ev_soc: float = Field(ge=0.0, le=1.0)
     ev_available: bool
-    predicted_net_power: float
     exchange_power: float
     instruction: str = Field(default='none', max_length=240)
     grid_alert: bool = False
+
+    @property
+    def pre_control_net_power(self) -> float:
+        return self.requested_load - self.pv_power
 
     @field_validator('instruction')
     @classmethod
@@ -36,7 +39,7 @@ class Observation(BaseModel):
         return value if value else 'none'
 
     def numerical_vector(self) -> Dict[str, float]:
-        return {'cleared_price': float(self.cleared_price), 'pv_power': float(self.pv_power), 'requested_load': float(self.requested_load), 'battery_soc': float(self.battery_soc), 'ev_soc': float(self.ev_soc), 'ev_available': float(self.ev_available), 'predicted_net_power': float(self.predicted_net_power), 'exchange_power': float(self.exchange_power)}
+        return {'cleared_price': float(self.cleared_price), 'pv_power': float(self.pv_power), 'requested_load': float(self.requested_load), 'battery_soc': float(self.battery_soc), 'ev_soc': float(self.ev_soc), 'ev_available': float(self.ev_available), 'pre_control_net_power': self.pre_control_net_power, 'exchange_power': float(self.exchange_power)}
 
 class FeatureStats(BaseModel):
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
@@ -44,7 +47,7 @@ class FeatureStats(BaseModel):
     std: float = Field(gt=0.0)
 
 class CriterionWeights(BaseModel):
-    model_config = ConfigDict(extra='forbid', populate_by_name=True, allow_inf_nan=False)
+    model_config = ConfigDict(extra='forbid', populate_by_name=True, allow_inf_nan=False, strict=True)
     profit: float = Field(alias='p', ge=0.0, le=1.0)
     comfort: float = Field(alias='c', ge=0.0, le=1.0)
     sufficiency: float = Field(alias='s', ge=0.0, le=1.0)
@@ -65,7 +68,7 @@ class CriterionWeights(BaseModel):
         return {'profit': self.profit, 'comfort': self.comfort, 'sufficiency': self.sufficiency, 'grid': self.grid}
 
 class CriterionScores(BaseModel):
-    model_config = ConfigDict(extra='forbid', populate_by_name=True, allow_inf_nan=False)
+    model_config = ConfigDict(extra='forbid', populate_by_name=True, allow_inf_nan=False, strict=True)
     profit: float = Field(alias='p', ge=0.0, le=1.0)
     comfort: float = Field(alias='c', ge=0.0, le=1.0)
     sufficiency: float = Field(alias='s', ge=0.0, le=1.0)
@@ -85,7 +88,7 @@ class AgentScoreMatrix(BaseModel):
         return {AgentName.PROFIT: self.profit_agent, AgentName.COMFORT: self.comfort_agent, AgentName.SELF: self.self_agent, AgentName.GRID: self.grid_agent}
 
 class EvidenceSummary(BaseModel):
-    model_config = ConfigDict(extra='forbid', populate_by_name=True, allow_inf_nan=False)
+    model_config = ConfigDict(extra='forbid', populate_by_name=True, allow_inf_nan=False, strict=True)
     grid_analysis: str = Field(alias='g', min_length=1, max_length=180)
     prosumer_analysis: str = Field(alias='p', min_length=1, max_length=180)
     market_analysis: str = Field(alias='m', min_length=1, max_length=180)
@@ -93,7 +96,7 @@ class EvidenceSummary(BaseModel):
     synthesis: str = Field(alias='s', min_length=1, max_length=220)
 
 class LLMAssessment(BaseModel):
-    model_config = ConfigDict(extra='forbid', populate_by_name=True, allow_inf_nan=False)
+    model_config = ConfigDict(extra='forbid', populate_by_name=True, allow_inf_nan=False, strict=True)
     priority_weights: CriterionWeights = Field(alias='w')
     agent_scores: AgentScoreMatrix = Field(alias='u')
     evidence: EvidenceSummary = Field(alias='e')
@@ -149,6 +152,7 @@ class ControllerSession(BaseModel):
     active_agent: AgentName = AgentName.SELF
     last_event_step: Optional[int] = None
     last_instruction: str = 'none'
+    last_grid_alert: bool = False
     history: List[Observation] = Field(default_factory=list)
 
 class DecisionResult(BaseModel):
@@ -185,3 +189,4 @@ class MemoryRecord(BaseModel):
     context_summary: Mapping[str, Any]
     outcome: EventOutcome
     similarity: Optional[float] = None
+

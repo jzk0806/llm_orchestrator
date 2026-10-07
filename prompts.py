@@ -11,13 +11,13 @@ continuous actions, or P2P bid prices.
 
 Allowed expert identifiers (use these exact strings):
 - Profit: prioritizes economic return and price-responsive arbitrage.
-- Comfort: prioritizes served flexible demand and low comfort curtailment.
+- Comfort: prioritizes additional flexible consumption above baseline demand.
 - Self: prioritizes local PV use and low dependence on external imports.
 - Grid: prioritizes low PCC ramping/peak import and grid-support behavior.
 
 Hard causal and security rules:
 1. Use only the supplied current observation, trailing history, current
-   prosumer instruction, current grid-alert pulse, and completed memories.
+   prosumer instruction, current persistent grid-alert state, and completed memories.
 2. Never infer or claim access to future prices, future weather, a full-day
    curve, or a future-confirmed local peak. "High price" means high relative
    to the supplied trailing window only.
@@ -28,7 +28,7 @@ Hard causal and security rules:
    apply the final Grid override after your pre-gate assessment.
 5. All four criterion scores use a higher-is-better convention:
    p = lower operating cost / greater economic return;
-   c = greater comfort / less flexible-load curtailment;
+   c = greater comfort through additional served flexible consumption;
    s = greater self-sufficiency / local renewable use;
    g = lower PCC ramping and peak import.
 6. Scores are context-dependent estimates, not guarantees of optimality or
@@ -83,11 +83,13 @@ Return exactly one JSON object with no Markdown and no extra keys:
 Every number must be in [0,1]. At least one weight must be positive. Keep each
 evidence string to one short sentence. Any expert favored in the evidence must
 also be supported by the weights and scores. This prompt version is fixed for
-all reported experiments.
+all calls in the configured run.
 """.strip()
 def _memory_payload(records: Sequence[MemoryRecord], current_step: int) -> list[Dict[str, Any]]:
     payload = []
     for record in records:
+        if record.completed_step >= current_step:
+            raise ValueError('Only memories completed before the current step are allowed.')
         item: Dict[str, Any] = {'age_intervals': current_step - record.completed_step, 'selected_agent': record.selected_agent.value, 'trigger_reasons': record.trigger_reasons, 'context_summary': dict(record.context_summary), 'outcome': {'metric_improvement': record.outcome.metric_improvement.model_dump(), 'constraint_violation': record.outcome.constraint_violation}}
         if record.similarity is not None:
             item['similarity'] = round(record.similarity, 6)
@@ -101,3 +103,4 @@ def build_user_prompt(*, semantic_context: Dict[str, Any], current_step: int, ev
 def build_repair_prompt(invalid_output: str, validation_error: str) -> str:
     payload = {'task': 'Repair the preceding assessment without changing its intended evidence.', 'validation_error': validation_error[:1200], 'invalid_output': invalid_output[:6000], 'instruction': 'Return only one valid JSON object matching the exact schema in the system prompt. Do not add Markdown or commentary.'}
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
