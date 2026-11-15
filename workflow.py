@@ -1,8 +1,10 @@
 from __future__ import annotations
 import hashlib
 import json
+import logging
 import math
-import os
+import sqlite3
+import statistics
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,16 +13,11 @@ from langgraph.graph import END, START, StateGraph
 from langsmith import tracing_context
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import NotRequired, TypedDict
-from .api import AssessmentCallError, AssessmentClient, ChatAPISettings, DeterministicHashEmbeddingClient, EmbeddingCallError, EmbeddingAPISettings, EmbeddingClient, OpenAICompatibleAssessmentClient, OpenAICompatibleEmbeddingClient
+from .local_inference import AssessmentCallError, AssessmentClient, DeterministicHashEmbeddingClient, EmbeddingCallError, EmbeddingClient, LocalAssessmentClient, LocalInferenceSettings
 from .memory import SQLiteMemoryStore
-from .models import AGENT_ORDER, FEATURE_ORDER, APIUsage, AgentName, ControllerSession, CriterionScores, DecisionResult, EventCompletionResult, EventOutcome, FeatureStats, LLMAssessment, MemoryRecord, Observation
+from .models import AGENT_ORDER, FEATURE_ORDER, APIUsage, AgentName, ControllerSession, CriterionScores, DecisionResult, DecisionSnapshot, EventCompletionResult, EventOutcome, FeatureStats, LLMAssessment, MemoryRecord, Observation
 from .prompts import SYSTEM_PROMPT, build_user_prompt
-
-def _env_bool(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+from .models import margin_reached, score_agent_candidates
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
@@ -68,6 +65,7 @@ class WorkflowState(TypedDict):
     price_z_score: NotRequired[float]
     state_change_inf: NotRequired[float]
     event_triggered: NotRequired[bool]
+    natural_event_triggered: NotRequired[bool]
     trigger_reasons: NotRequired[List[str]]
     short_memory: NotRequired[List[MemoryRecord]]
     long_memory: NotRequired[List[MemoryRecord]]
@@ -83,21 +81,41 @@ class WorkflowState(TypedDict):
     agent_scores: NotRequired[Dict[str, Dict[str, float]]]
     reasoning_summary: NotRequired[Dict[str, str]]
     confidence: NotRequired[float]
-    pre_gate_proposal: NotRequired[AgentName]
+    pre_gate_proposal: NotRequired[Optional[AgentName]]
     selected_agent: NotRequired[AgentName]
     handover_gain: NotRequired[float]
+    handover_gain_fraction: NotRequired[str]
     event_id: NotRequired[Optional[str]]
+    switching_penalty: NotRequired[float]
+    handover_margin: NotRequired[float]
+    captured_input_json: NotRequired[str]
+    storage_fault: NotRequired[str]
+
+class StorageFaultDecision(DecisionResult):
+    active_agent_before: Optional[AgentName] = None
+    switched: Optional[bool] = None
+    storage_fault: str
+    state_persisted: bool = False
 
 class PaperLLMOrchestrator:
 
-    def __init__(self, *, config: OrchestratorConfig, memory_store: SQLiteMemoryStore, assessment_client: AssessmentClient, embedding_client: EmbeddingClient, audit_log_path: Optional[str | Path]=None) -> None:
+    def __init__(self, *, config: OrchestratorConfig, memory_store: SQLiteMemoryStore, assessment_client: AssessmentClient, embedding_client: EmbeddingClient, audit_log_path: Optional[str | Path]=None, snapshot_log_path: Optional[str | Path]=None, assessment_mode: str='event_triggered') -> None:
+        if assessment_mode not in {'event_triggered', 'every_step'}:
+            raise ValueError("assessment_mode must be 'event_triggered' or 'every_step'.")
         self.config = config
         self.memory = memory_store
         self.assessment_client = assessment_client
         self.embedding_client = embedding_client
+        self.assessment_mode = assessment_mode
         self.audit_log_path = Path(audit_log_path).expanduser().resolve() if audit_log_path else None
+        self.snapshot_log_path = Path(snapshot_log_path).expanduser().resolve() if snapshot_log_path else None
         if self.audit_log_path:
             self.audit_log_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.snapshot_log_path:
+            self.snapshot_log_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.audit_log_path is not None and self.audit_log_path == self.snapshot_log_path:
+            raise ValueError('Decision and snapshot logs must use distinct paths.')
+        self._log_lock = threading.RLock()
         self._lock_guard = threading.Lock()
         self._prosumer_locks: Dict[str, threading.RLock] = {}
         self.graph = self._build_graph()
@@ -107,21 +125,13 @@ class PaperLLMOrchestrator:
             return self._prosumer_locks.setdefault(prosumer_id, threading.RLock())
 
     @classmethod
-    def from_environment(cls, *, config_path: str | Path, database_path: str | Path, env_file: Optional[str | Path]=None, audit_log_path: Optional[str | Path]=None, assessment_client: Optional[AssessmentClient]=None, embedding_client: Optional[EmbeddingClient]=None) -> 'PaperLLMOrchestrator':
-        if env_file is not None:
-            raise ValueError('Configure credentials through process environment variables.')
+    def from_local_checkpoint(cls, *, config_path: str | Path, database_path: str | Path, checkpoint_dir: str | Path, audit_log_path: Optional[str | Path]=None, snapshot_log_path: Optional[str | Path]=None, assessment_mode: str='event_triggered', assessment_client: Optional[AssessmentClient]=None, embedding_client: Optional[EmbeddingClient]=None) -> 'PaperLLMOrchestrator':
         config = OrchestratorConfig.from_json(config_path)
         if assessment_client is None:
-            assessment_client = OpenAICompatibleAssessmentClient(ChatAPISettings.from_environment())
+            assessment_client = LocalAssessmentClient(LocalInferenceSettings(checkpoint_dir=str(checkpoint_dir)))
         if embedding_client is None:
-            backend = os.getenv('EMBEDDING_BACKEND', 'hash').strip().lower()
-            if backend == 'api':
-                embedding_client = OpenAICompatibleEmbeddingClient(EmbeddingAPISettings.from_environment())
-            elif backend == 'hash':
-                embedding_client = DeterministicHashEmbeddingClient(dimensions=int(os.getenv('HASH_EMBEDDING_DIMENSIONS', '256')))
-            else:
-                raise ValueError("EMBEDDING_BACKEND must be 'api' or 'hash'.")
-        return cls(config=config, memory_store=SQLiteMemoryStore(database_path), assessment_client=assessment_client, embedding_client=embedding_client, audit_log_path=audit_log_path)
+            embedding_client = DeterministicHashEmbeddingClient(dimensions=256)
+        return cls(config=config, memory_store=SQLiteMemoryStore(database_path), assessment_client=assessment_client, embedding_client=embedding_client, audit_log_path=audit_log_path, snapshot_log_path=snapshot_log_path, assessment_mode=assessment_mode)
 
     def _normalize(self, observation: Observation) -> Dict[str, float]:
         vector = observation.numerical_vector()
@@ -151,11 +161,10 @@ class PaperLLMOrchestrator:
         prices = [item.cleared_price for item in previous_history[-self.config.lookback_intervals:]]
         if len(prices) < self.config.minimum_price_history:
             return 0.0
-        mean = sum(prices) / len(prices)
-        variance = sum(((price - mean) ** 2 for price in prices)) / len(prices)
-        std = math.sqrt(variance)
-        if std <= 1e-09:
-            return 0.0 if abs(current_price - mean) <= 1e-09 else math.copysign(10.0, current_price - mean)
+        mean = statistics.mean(prices)
+        std = statistics.pstdev(prices)
+        if std == 0.0:
+            return 0.0 if current_price == mean else math.copysign(10.0, current_price - mean)
         return (current_price - mean) / std
 
     def _semantic_mapping(self, state: WorkflowState) -> Dict[str, Any]:
@@ -194,7 +203,10 @@ class PaperLLMOrchestrator:
             reasons.append('material_state_change')
         if session.last_event_step is not None and observation.step - session.last_event_step >= self.config.maximum_event_gap:
             reasons.append('timeout')
-        return {'event_triggered': bool(reasons), 'trigger_reasons': reasons}
+        natural_event = bool(reasons)
+        if self.assessment_mode == 'every_step' and not natural_event:
+            reasons.append('every_step')
+        return {'event_triggered': bool(reasons), 'natural_event_triggered': natural_event, 'trigger_reasons': reasons}
 
     @staticmethod
     def _route_event(state: WorkflowState) -> str:
@@ -203,10 +215,19 @@ class PaperLLMOrchestrator:
     def _retrieve_node(self, state: WorkflowState) -> Dict[str, Any]:
         observation = state['observation']
         context_text = _canonical_json(state['semantic_context'])
-        short_memory = self.memory.recent_completed(prosumer_id=observation.prosumer_id, before_step=observation.step, limit=self.config.short_memory_capacity)
+        try:
+            short_memory = self.memory.recent_completed(prosumer_id=observation.prosumer_id, before_step=observation.step, limit=self.config.short_memory_capacity)
+        except sqlite3.Error as error:
+            fault = self._storage_fault_message(error, 'short_memory_read')
+            return {'storage_fault': fault, 'short_memory': [], 'long_memory': [], 'embedding_usage': APIUsage(), 'retrieval_warning': fault}
+        embedding_result = None
         try:
             embedding_result = self.embedding_client.embed(context_text)
             long_memory = self.memory.similar_salient(prosumer_id=observation.prosumer_id, before_step=observation.step, query_embedding=embedding_result.vector, embedding_identifier=embedding_result.identifier, top_k=self.config.long_memory_top_k)
+        except sqlite3.Error as error:
+            fault = self._storage_fault_message(error, 'long_memory_read')
+            usage = embedding_result.usage if embedding_result is not None else APIUsage()
+            return {'storage_fault': fault, 'short_memory': short_memory, 'long_memory': [], 'embedding_usage': usage, 'retrieval_warning': fault}
         except Exception as error:
             long_memory = []
             failed_usage = error.usage if isinstance(error, EmbeddingCallError) else APIUsage()
@@ -214,11 +235,20 @@ class PaperLLMOrchestrator:
         return {'short_memory': short_memory, 'long_memory': long_memory, 'embedding_usage': embedding_result.usage}
 
     def _reason_node(self, state: WorkflowState) -> Dict[str, Any]:
-        prompt = build_user_prompt(semantic_context=state['semantic_context'], current_step=state['observation'].step, event_reasons=state['trigger_reasons'], short_term_memory=state.get('short_memory', []), long_term_memory=state.get('long_memory', []))
+        if state.get('storage_fault'):
+            return {'assessment': None, 'api_usage': state.get('embedding_usage', APIUsage()), 'prompt_sha256': None, 'fallback_used': True, 'fallback_reason': state['storage_fault']}
+        observation = state['observation']
+        context = json.loads(_canonical_json(state['semantic_context']))
+        reasons = list(state['trigger_reasons'])
+        short_memory = [record.model_copy(deep=True) for record in state.get('short_memory', [])]
+        long_memory = [record.model_copy(deep=True) for record in state.get('long_memory', [])]
+        prompt = build_user_prompt(semantic_context=context, current_step=observation.step, event_reasons=reasons, short_term_memory=short_memory, long_term_memory=long_memory)
+        prompt_hash = hashlib.sha256((SYSTEM_PROMPT + '\n' + prompt).encode('utf-8')).hexdigest()
+        captured = _canonical_json({'input_id': f'{observation.prosumer_id}:{observation.step}', 'system_prompt': SYSTEM_PROMPT, 'user_prompt': prompt, 'snapshot_json': _canonical_json({'current_step': observation.step, 'semantic_context': context, 'event_reasons': reasons, 'short_term_memory': [record.model_dump(mode='json') for record in short_memory], 'long_term_memory': [record.model_dump(mode='json') for record in long_memory]}), 'incumbent': state['active_before'].value, 'grid_alert': observation.grid_alert, 'switching_penalty': state.get('switching_penalty', self.config.switching_penalty), 'handover_margin': state.get('handover_margin', self.config.handover_margin), 'prompt_sha256': prompt_hash})
         try:
-            assessment, usage, prompt_hash = self.assessment_client.assess(prompt)
+            assessment, usage, _ = self.assessment_client.assess(prompt)
             assessment = LLMAssessment.model_validate(assessment.model_dump(by_alias=True) if isinstance(assessment, LLMAssessment) else assessment)
-            return {'assessment': assessment, 'api_usage': state.get('embedding_usage', APIUsage()).add(usage), 'prompt_sha256': prompt_hash, 'fallback_used': False}
+            return {'assessment': assessment, 'api_usage': state.get('embedding_usage', APIUsage()).add(usage), 'prompt_sha256': prompt_hash, 'captured_input_json': captured, 'fallback_used': False}
         except Exception as error:
             retrieval_warning = state.get('retrieval_warning')
             parts = [f'LLM assessment unavailable: {type(error).__name__}']
@@ -226,34 +256,20 @@ class PaperLLMOrchestrator:
                 parts.append(retrieval_warning)
             if isinstance(error, AssessmentCallError):
                 chat_usage = error.usage
-                prompt_hash = error.prompt_sha256
             else:
                 chat_usage = APIUsage(calls=1)
-                prompt_hash = hashlib.sha256((SYSTEM_PROMPT + '\n' + prompt).encode('utf-8')).hexdigest()
-            return {'assessment': None, 'api_usage': state.get('embedding_usage', APIUsage()).add(chat_usage), 'prompt_sha256': prompt_hash, 'fallback_used': True, 'fallback_reason': ' | '.join(parts)}
+            return {'assessment': None, 'api_usage': state.get('embedding_usage', APIUsage()).add(chat_usage), 'prompt_sha256': prompt_hash, 'captured_input_json': captured, 'fallback_used': True, 'fallback_reason': ' | '.join(parts)}
 
     def _score_node(self, state: WorkflowState) -> Dict[str, Any]:
         active = state['active_before']
         assessment = state.get('assessment')
         if assessment is None:
-            return {'q_scores': {agent.value: 0.0 if agent == active else -1.0 for agent in AGENT_ORDER}, 'priority_weights': {}, 'agent_scores': {}, 'reasoning_summary': {}, 'confidence': 0.0, 'pre_gate_proposal': active, 'handover_gain': 0.0}
-        weights = assessment.priority_weights.normalized().as_dict()
+            return {'q_scores': {}, 'priority_weights': {}, 'agent_scores': {}, 'reasoning_summary': {}, 'confidence': 0.0, 'pre_gate_proposal': None, 'handover_gain': 0.0, 'handover_gain_fraction': '0'}
+        weights, q_scores, proposal, gain = score_agent_candidates(assessment, active, state.get('switching_penalty', self.config.switching_penalty))
         score_matrix = assessment.agent_scores.as_mapping()
-        q_scores: Dict[str, float] = {}
-        serializable_scores: Dict[str, Dict[str, float]] = {}
-        for agent in AGENT_ORDER:
-            scores = score_matrix[agent].as_dict()
-            serializable_scores[agent.value] = scores
-            weighted_score = sum((weights[key] * scores[key] for key in weights))
-            if agent != active:
-                weighted_score -= self.config.switching_penalty
-            q_scores[agent.value] = weighted_score
-        best_score = max(q_scores.values())
-        tied = [agent for agent in AGENT_ORDER if best_score - q_scores[agent.value] <= 1e-12]
-        proposal = active if active in tied else tied[0]
-        handover_gain = q_scores[proposal.value] - q_scores[active.value]
+        serializable_scores = {agent.value: score_matrix[agent].as_dict() for agent in AGENT_ORDER}
         evidence = assessment.evidence
-        return {'q_scores': q_scores, 'priority_weights': weights, 'agent_scores': serializable_scores, 'reasoning_summary': {'grid_analysis': evidence.grid_analysis, 'prosumer_analysis': evidence.prosumer_analysis, 'market_analysis': evidence.market_analysis, 'memory_analysis': evidence.memory_analysis, 'synthesis': evidence.synthesis}, 'confidence': assessment.confidence, 'pre_gate_proposal': proposal, 'handover_gain': handover_gain}
+        return {'q_scores': q_scores, 'priority_weights': weights, 'agent_scores': serializable_scores, 'reasoning_summary': {'grid_analysis': evidence.grid_analysis, 'prosumer_analysis': evidence.prosumer_analysis, 'market_analysis': evidence.market_analysis, 'memory_analysis': evidence.memory_analysis, 'synthesis': evidence.synthesis}, 'confidence': assessment.confidence, 'pre_gate_proposal': proposal, 'handover_gain': float(gain), 'handover_gain_fraction': str(gain)}
 
     def _safety_handover_node(self, state: WorkflowState) -> Dict[str, Any]:
         active = state['active_before']
@@ -261,7 +277,7 @@ class PaperLLMOrchestrator:
             selected = AgentName.GRID
         elif state.get('fallback_used', False):
             selected = active
-        elif state['pre_gate_proposal'] != active and state['handover_gain'] + 1e-12 >= self.config.handover_margin:
+        elif state['pre_gate_proposal'] is not None and state['pre_gate_proposal'] != active and margin_reached(state.get('handover_gain_fraction', state['handover_gain']), state.get('handover_margin', self.config.handover_margin)):
             selected = state['pre_gate_proposal']
         else:
             selected = active
@@ -270,20 +286,29 @@ class PaperLLMOrchestrator:
     @staticmethod
     def _retain_node(state: WorkflowState) -> Dict[str, Any]:
         active = state['active_before']
-        return {'short_memory': [], 'long_memory': [], 'assessment': None, 'api_usage': APIUsage(), 'embedding_usage': APIUsage(), 'prompt_sha256': None, 'fallback_used': False, 'fallback_reason': None, 'q_scores': {}, 'priority_weights': {}, 'agent_scores': {}, 'reasoning_summary': {}, 'confidence': 0.0, 'pre_gate_proposal': active, 'selected_agent': active, 'handover_gain': 0.0}
+        return {'short_memory': [], 'long_memory': [], 'assessment': None, 'api_usage': APIUsage(), 'embedding_usage': APIUsage(), 'prompt_sha256': None, 'fallback_used': False, 'fallback_reason': None, 'q_scores': {}, 'priority_weights': {}, 'agent_scores': {}, 'reasoning_summary': {}, 'confidence': 0.0, 'pre_gate_proposal': None, 'selected_agent': active, 'handover_gain': 0.0}
 
     def _persist_node(self, state: WorkflowState) -> Dict[str, Any]:
         observation = state['observation']
         session = state['session'].model_copy(deep=True)
         event_id: Optional[str] = None
-        if state['event_triggered']:
+        if state['event_triggered'] and not state.get('storage_fault'):
             event_id = self.memory.stage_event(prosumer_id=observation.prosumer_id, decision_step=observation.step, context=state['semantic_context'], selected_agent=state['selected_agent'], trigger_reasons=state['trigger_reasons'])
+        if state['natural_event_triggered']:
             session.last_event_step = observation.step
         session.active_agent = state['selected_agent']
         session.last_instruction = observation.instruction
         session.last_grid_alert = observation.grid_alert
         session.history = (session.history + [observation])[-self.config.lookback_intervals:]
-        self.memory.save_session(session)
+        try:
+            self.memory.save_session(session)
+        except sqlite3.Error as error:
+            if not state.get('storage_fault'):
+                raise
+            fault = state['storage_fault'] + '; ' + self._storage_fault_message(error, 'fallback_session_write')
+            return {'session': session, 'event_id': None, 'storage_fault': fault, 'retrieval_warning': fault, 'fallback_reason': fault + '; fallback_state_persisted=false'}
+        if state.get('storage_fault'):
+            return {'session': session, 'event_id': None, 'fallback_reason': state['storage_fault'] + '; fallback_state_persisted=true'}
         return {'session': session, 'event_id': event_id}
 
     def _build_graph(self):
@@ -312,7 +337,21 @@ class PaperLLMOrchestrator:
             return self._decide_locked(observation)
 
     def _decide_locked(self, observation: Observation) -> DecisionResult:
-        session = self.memory.load_session(observation.prosumer_id, self.config.initial_agent)
+        observation = observation.model_copy(deep=True)
+        try:
+            session = self.memory.load_session(observation.prosumer_id, self.config.initial_agent)
+        except sqlite3.Error as error:
+            fault = self._storage_fault_message(error, 'session_read')
+            if not observation.grid_alert:
+                raise
+            result = StorageFaultDecision(prosumer_id=observation.prosumer_id, step=observation.step,
+                event_triggered=False, natural_event_triggered=False, trigger_reasons=['storage_fault', 'active_grid_alert'],
+                api_called=False, active_agent_before=None, pre_gate_proposal=None, selected_agent=AgentName.GRID,
+                switched=None, fallback_used=True, retrieval_warning=fault,
+                fallback_reason=fault + '; incumbent_unknown; Grid_override; fallback_state_persisted=false',
+                storage_fault=fault, state_persisted=False)
+            self._write_fault_audit(result)
+            return result
         if not session.history and observation.step != 1:
             raise ValueError('A new controller session starts at step 1.')
         if session.history:
@@ -322,10 +361,29 @@ class PaperLLMOrchestrator:
             if (observation.timestamp - previous.timestamp).total_seconds() != 900:
                 raise ValueError('Observation timestamps must be 15 minutes apart.')
         with tracing_context(enabled=False):
-            final_state = self.graph.invoke({'observation': observation, 'session': session, 'active_before': session.active_agent})
-        result = DecisionResult(prosumer_id=observation.prosumer_id, step=observation.step, event_triggered=final_state['event_triggered'], trigger_reasons=final_state['trigger_reasons'], api_called=final_state['api_usage'].calls > 0, active_agent_before=final_state['active_before'], pre_gate_proposal=final_state['pre_gate_proposal'], selected_agent=final_state['selected_agent'], switched=final_state['selected_agent'] != final_state['active_before'], handover_gain=final_state['handover_gain'], q_scores=final_state['q_scores'], priority_weights=final_state['priority_weights'], agent_scores=final_state['agent_scores'], reasoning_summary=final_state['reasoning_summary'], confidence=final_state['confidence'], event_id=final_state.get('event_id'), retrieval_warning=final_state.get('retrieval_warning'), fallback_used=final_state.get('fallback_used', False), fallback_reason=final_state.get('fallback_reason'), prompt_sha256=final_state.get('prompt_sha256'), api_usage=final_state['api_usage'])
-        self._write_audit(result)
+            final_state = self.graph.invoke({'observation': observation, 'session': session, 'active_before': session.active_agent, 'switching_penalty': self.config.switching_penalty, 'handover_margin': self.config.handover_margin})
+        result = DecisionResult(prosumer_id=observation.prosumer_id, step=observation.step, event_triggered=final_state['event_triggered'], natural_event_triggered=final_state['natural_event_triggered'], trigger_reasons=final_state['trigger_reasons'], api_called=final_state['api_usage'].calls > 0, active_agent_before=final_state['active_before'], pre_gate_proposal=final_state['pre_gate_proposal'], selected_agent=final_state['selected_agent'], switched=final_state['selected_agent'] != final_state['active_before'], handover_gain=final_state['handover_gain'], q_scores=final_state['q_scores'], priority_weights=final_state['priority_weights'], agent_scores=final_state['agent_scores'], reasoning_summary=final_state['reasoning_summary'], confidence=final_state['confidence'], event_id=final_state.get('event_id'), retrieval_warning=final_state.get('retrieval_warning'), fallback_used=final_state.get('fallback_used', False), fallback_reason=final_state.get('fallback_reason'), prompt_sha256=final_state.get('prompt_sha256'), api_usage=final_state['api_usage'])
+        result.natural_event_triggered = final_state['natural_event_triggered']
+        if final_state.get('storage_fault'):
+            self._write_fault_audit(result)
+        else:
+            self._write_audit(result)
+        self._write_snapshot(final_state, result)
         return result
+
+    @staticmethod
+    def _storage_fault_message(error: sqlite3.Error, operation: str) -> str:
+        fault = f'storage_fault:sqlite3:{operation}:{type(error).__name__}'
+        logging.getLogger(__name__).error(fault)
+        return fault
+
+    def _write_fault_audit(self, result: DecisionResult) -> None:
+        try:
+            self._write_audit(result)
+        except OSError as error:
+            warning = f'fault_audit_unavailable:{type(error).__name__}'
+            result.fallback_reason = (result.fallback_reason or '') + '; ' + warning
+            logging.getLogger(__name__).error(warning)
 
     def complete_event(self, *, event_id: str, completed_step: int, outcome: EventOutcome) -> EventCompletionResult:
         row = self.memory.pending_event(event_id)
@@ -356,8 +414,15 @@ class PaperLLMOrchestrator:
     def _write_audit(self, result: DecisionResult) -> None:
         if self.audit_log_path is None:
             return
-        with self.audit_log_path.open('a', encoding='utf-8') as stream:
+        with self._log_lock, self.audit_log_path.open('a', encoding='utf-8') as stream:
             stream.write(result.model_dump_json() + '\n')
+
+    def _write_snapshot(self, state: WorkflowState, result: DecisionResult) -> None:
+        if self.snapshot_log_path is None or 'captured_input_json' not in state:
+            return
+        snapshot = DecisionSnapshot(**json.loads(state['captured_input_json']), result_json=result.model_dump_json())
+        with self._log_lock, self.snapshot_log_path.open('a', encoding='utf-8') as stream:
+            stream.write(snapshot.model_dump_json() + '\n')
 
 class RLPolicy(Protocol):
 
@@ -380,4 +445,5 @@ class RLAgentRegistry:
     def dispatch(self, decision: DecisionResult, rl_state: Mapping[str, Any]) -> Any:
         self.validate_complete()
         return self._policies[decision.selected_agent](rl_state)
+
 

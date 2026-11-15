@@ -1,4 +1,7 @@
 from __future__ import annotations
+import hashlib
+import json
+from fractions import Fraction
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Mapping, Optional
@@ -56,7 +59,7 @@ class CriterionWeights(BaseModel):
     @model_validator(mode='after')
     def require_positive_total(self) -> 'CriterionWeights':
         if sum(self.as_dict().values()) <= 1e-12:
-            raise ValueError('At least one priority weight must be positive.')
+            raise ValueError('Priority weights must sum to more than 1e-12.')
         return self
 
     def normalized(self) -> 'CriterionWeights':
@@ -102,6 +105,28 @@ class LLMAssessment(BaseModel):
     evidence: EvidenceSummary = Field(alias='e')
     confidence: float = Field(alias='c', ge=0.0, le=1.0)
 
+def score_agent_candidates(assessment: LLMAssessment, incumbent: AgentName, switching_penalty: float) -> tuple[Dict[str, float], Dict[str, float], AgentName, Fraction]:
+    active = AgentName(incumbent)
+    raw_weights = {name: Fraction(str(value)) for name, value in assessment.priority_weights.as_dict().items()}
+    total = sum(raw_weights.values(), Fraction(0))
+    penalty = Fraction(str(switching_penalty))
+    matrix = assessment.agent_scores.as_mapping()
+    exact_scores = {}
+    for agent in AGENT_ORDER:
+        row = matrix[agent].as_dict()
+        score = sum((weight * Fraction(str(row[name])) for name, weight in raw_weights.items()), Fraction(0)) / total
+        exact_scores[agent] = score - (penalty if agent != active else Fraction(0))
+    maximum = max(exact_scores.values())
+    tied = [agent for agent in AGENT_ORDER if maximum - exact_scores[agent] <= Fraction('1e-12')]
+    proposal = active if active in tied else tied[0]
+    gain = exact_scores[proposal] - exact_scores[active]
+    weights = {name: float(weight / total) for name, weight in raw_weights.items()}
+    scores = {agent.value: float(exact_scores[agent]) for agent in AGENT_ORDER}
+    return weights, scores, proposal, gain
+
+def margin_reached(gain: Fraction | str | float, margin: float) -> bool:
+    return Fraction(str(gain)) >= Fraction(str(margin))
+
 class OutcomeDelta(BaseModel):
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
     profit: float = Field(default=0.0, ge=-1.0, le=1.0)
@@ -124,13 +149,14 @@ class APIUsage(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     latency_ms: float = 0.0
+    request_latencies_ms: List[float] = Field(default_factory=list)
     schema_repairs: int = 0
     embedding_calls: int = 0
     embedding_input_tokens: int = 0
     embedding_latency_ms: float = 0.0
 
     def add(self, other: 'APIUsage') -> 'APIUsage':
-        return APIUsage(calls=self.calls + other.calls, input_tokens=self.input_tokens + other.input_tokens, output_tokens=self.output_tokens + other.output_tokens, latency_ms=self.latency_ms + other.latency_ms, schema_repairs=self.schema_repairs + other.schema_repairs, embedding_calls=self.embedding_calls + other.embedding_calls, embedding_input_tokens=self.embedding_input_tokens + other.embedding_input_tokens, embedding_latency_ms=self.embedding_latency_ms + other.embedding_latency_ms)
+        return APIUsage(calls=self.calls + other.calls, input_tokens=self.input_tokens + other.input_tokens, output_tokens=self.output_tokens + other.output_tokens, latency_ms=self.latency_ms + other.latency_ms, request_latencies_ms=self.request_latencies_ms + other.request_latencies_ms, schema_repairs=self.schema_repairs + other.schema_repairs, embedding_calls=self.embedding_calls + other.embedding_calls, embedding_input_tokens=self.embedding_input_tokens + other.embedding_input_tokens, embedding_latency_ms=self.embedding_latency_ms + other.embedding_latency_ms)
 
 class EmbeddingResult(BaseModel):
     model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
@@ -160,10 +186,11 @@ class DecisionResult(BaseModel):
     prosumer_id: str
     step: int
     event_triggered: bool
+    natural_event_triggered: bool = False
     trigger_reasons: List[str]
     api_called: bool
     active_agent_before: AgentName
-    pre_gate_proposal: AgentName
+    pre_gate_proposal: Optional[AgentName] = Field(default=None, description='Initial proposal before alert and handover rules, or null when no valid assessment exists; legacy serialized field name.')
     selected_agent: AgentName
     switched: bool
     handover_gain: float = 0.0
@@ -178,6 +205,35 @@ class DecisionResult(BaseModel):
     fallback_reason: Optional[str] = None
     prompt_sha256: Optional[str] = None
     api_usage: APIUsage = Field(default_factory=APIUsage)
+
+    @property
+    def initial_proposal(self) -> Optional[AgentName]:
+        return self.pre_gate_proposal
+
+class DecisionSnapshot(BaseModel):
+    model_config = ConfigDict(extra='forbid', allow_inf_nan=False, frozen=True)
+    input_id: str = Field(min_length=1)
+    system_prompt: str = Field(min_length=1)
+    user_prompt: str = Field(min_length=1)
+    snapshot_json: str
+    incumbent: AgentName
+    grid_alert: bool
+    switching_penalty: float = Field(ge=0.0)
+    handover_margin: float = Field(ge=0.0)
+    prompt_sha256: str
+    result_json: str
+
+    @model_validator(mode='after')
+    def validate_capture(self) -> 'DecisionSnapshot':
+        expected = hashlib.sha256((self.system_prompt + '\n' + self.user_prompt).encode('utf-8')).hexdigest()
+        if self.prompt_sha256 != expected:
+            raise ValueError('The captured prompt hash does not match its exact text.')
+        if not isinstance(json.loads(self.snapshot_json), dict):
+            raise ValueError('The decision snapshot must encode an object.')
+        result = json.loads(self.result_json)
+        if not isinstance(result, dict) or result.get('prompt_sha256') != expected:
+            raise ValueError('The recorded decision must use the captured prompt hash.')
+        return self
 
 class MemoryRecord(BaseModel):
     model_config = ConfigDict(extra='forbid')
